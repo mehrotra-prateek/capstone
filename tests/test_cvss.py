@@ -56,8 +56,8 @@ class TestCVSSFunctions(unittest.TestCase):
                         "cvssMetricV31": [{
                             "cvssData": {
                                 "baseScore": 7.5,
-                                "baseSeverity": "HIGH"
-                            }
+                            },
+                            "baseSeverity": "HIGH"
                         }]
                     }
                 }

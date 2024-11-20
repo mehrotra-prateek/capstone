@@ -59,16 +59,22 @@ def get_cve_cvss(cve_id):
             if "cvssMetricV31" in impact:
                 cvss_v3 = impact["cvssMetricV31"][0]["cvssData"]
                 return {
+                    "attack_vector": cvss_v3["attackVector"],
+                    "attack_complexity": cvss_v3["attackComplexity"],
                     "cvss_score": cvss_v3["baseScore"],
                     "severity": cvss_v3["baseSeverity"]
                 }
             elif "cvssMetricV2" in impact:
                 cvss_v2 = impact["cvssMetricV2"][0]["cvssData"]
                 return {
+                    "attack_vector": cvss_v2["accessVector"],
+                    "attack_complexity": cvss_v2["accessVector"],
                     "cvss_score": cvss_v2["baseScore"],
                     "severity": impact["cvssMetricV2"][0]["baseSeverity"]
                 }
         return {
+            "attack_vector": None,
+            "attack_complexity": None,
             "cvss_score": None,
             "severity": None
         }
@@ -76,9 +82,143 @@ def get_cve_cvss(cve_id):
     except (requests.RequestException, KeyError) as e:
         print(f"Error fetching CVE data for {cve_id}: {e}")
         return {
+            "attack_vector": None,
+            "attack_complexity": None,
             "cvss_score": None,
             "severity": None
         }
+
+
+def get_cwe_details_from_api(cwe_id):
+    """
+    : str) -> Optional[Dict]
+    Fetch CWE details from the official CWE API.
+
+    Args:
+        cwe_id (str): CWE identifier (e.g., "CWE-79" or "79")
+
+    Returns:
+        Optional[Dict]: Dictionary containing CWE details if found,
+        None otherwise
+        {
+            'name': str,
+            'description': str,
+            'extended_description': str,
+            'likelihood': str
+        }
+    """
+    # Handle NaN or empty values
+    if pd.isna(cwe_id) or not str(cwe_id).strip():
+        return None
+
+    # Normalize CWE ID format - extract number only
+    try:
+        cwe_number = str(cwe_id).replace('CWE-', '').strip()
+        cwe_number = int(cwe_number)
+
+    except ValueError:
+        return None
+
+    # API endpoint
+    api_url = f"https://cwe-api.mitre.org/api/v1/cwe/weakness/{cwe_number}"
+
+    try:
+        response = requests.get(
+            api_url,
+            timeout=(5, 30)
+            )
+        response.raise_for_status()
+
+        data = response.json()
+
+        # Extract relevant information
+        if response.status_code == 200:
+            data = response.json()
+            if 'Weaknesses' in data and len(data['Weaknesses']) > 0:
+                weakness = data['Weaknesses'][0]
+                return {
+                    'name': weakness.get('Name', ''),
+                    'status': weakness.get('Status', ''),
+                    'description': weakness.get('Description', ''),
+                    'likelihood': weakness.get('LikelihoodOfExploit', '')
+                }
+        return {}
+    except (requests.RequestException, ValueError, KeyError) as e:
+        print(f"Error fetching CWE-{cwe_number}: {str(e)}")
+        return {}
+
+
+def enrich_df_with_cwe_details(df):
+    """
+    Add CWE details to DataFrame as new columns.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame containing CWE IDs
+
+    Returns:
+        pd.DataFrame: DataFrame with added CWE detail columns
+    """
+    # Verify CWE column exists
+    if 'cwes' not in df.columns:
+        raise ValueError("Column 'cwes' not found in DataFrame")
+
+    # Create a copy of the DataFrame
+    result_df = df.copy()
+
+    # Initialize new columns
+    new_columns = [
+        'cwe_name', 'cwe_weakness_abstraction',
+        'cwe_status', 'cwe_likelihood', 'cwe_description'
+    ]
+    for col in new_columns:
+        result_df[col] = None
+
+    # Process each unique CWE to avoid duplicate API calls
+    unique_cwes = df['cwes'].unique()
+    cwe_details_cache = {}
+
+    for cwe in unique_cwes:
+        if pd.isna(cwe):
+            continue
+
+        # Add rate limiting to avoid overwhelming the API
+        time.sleep(0.1)
+
+        details = get_cwe_details_from_api(cwe)
+        cwe_details_cache[cwe] = details
+
+    # Update DataFrame with cached details
+    for cwe in unique_cwes:
+        try:
+            if pd.isna(cwe):
+                continue
+
+            details = cwe_details_cache[cwe]
+            mask = df['cwes'] == cwe
+
+            if details is not None:  # Check if details exists
+                df.loc[mask, 'CWE_Name'] = details.get('name', '')
+                df.loc[mask, 'CWE_Extended_Description'] = (
+                    details.get('extended_description', ''))
+                df.loc[mask, 'CWE_Likelihood'] = details.get('likelihood', '')
+                df.loc[mask, 'CWE_Severity'] = details.get('severity', '')
+            else:
+                # Set empty values if details is None
+                df.loc[mask, 'CWE_Name'] = ''
+                df.loc[mask, 'CWE_Extended_Description'] = ''
+                df.loc[mask, 'CWE_Likelihood'] = ''
+                df.loc[mask, 'CWE_Severity'] = ''
+
+        except (KeyError, AttributeError) as e:
+            print(f"Error processing CWE {cwe}: {str(e)}")
+            # Set empty values for this CWE
+            mask = df['cwes'] == cwe
+            df.loc[mask, 'CWE_Name'] = ''
+            df.loc[mask, 'CWE_Extended_Description'] = ''
+            df.loc[mask, 'CWE_Likelihood'] = ''
+            df.loc[mask, 'CWE_Severity'] = ''
+
+    return df
 
 
 def process_cisa_vulnerabilities_to_df(dataframe, delay=1.0):
@@ -105,8 +245,11 @@ def process_cisa_vulnerabilities_to_df(dataframe, delay=1.0):
     new_df = dataframe.copy()
 
     # Initialize new columns
-    new_df['cvss_score'] = None
-    new_df['severity'] = None
+    new_columns = [
+        'attack_vector', 'attack_complexity', 'cvss_score', 'severity'
+    ]
+    for col in new_columns:
+        new_df[col] = None
 
     total_cves = len(new_df)
     print(f"Processing {total_cves} CVE IDs...\n")
@@ -119,6 +262,8 @@ def process_cisa_vulnerabilities_to_df(dataframe, delay=1.0):
         cvss_data = get_cve_cvss(cve_id)
 
         # Update the DataFrame
+        new_df.at[index, 'attack_vector'] = cvss_data['attack_vector']
+        new_df.at[index, 'attack_complexity'] = cvss_data['attack_complexity']
         new_df.at[index, 'cvss_score'] = cvss_data['cvss_score']
         new_df.at[index, 'severity'] = cvss_data['severity']
 
@@ -201,7 +346,6 @@ def process_cisa_vulnerabilities(dataframe, delay=1.0):
         print(f"Processing {index} of {total_cves}: {cve_id}")
         get_cve_cvss(cve_id)
         print("-" * 50)  # Separator line for readability
-        
         # Add delay between requests to avoid rate limiting
         if index < total_cves:  # Don't delay after the last item
             time.sleep(delay)
@@ -215,10 +359,13 @@ if __name__ == "__main__":
     if cisa_df is not None:
         # Create enhanced DataFrame with CVSS data
         enhanced_df = process_cisa_vulnerabilities_to_df(cisa_df)
-        if 'notes' in enhanced_df.columns:
-            enhanced_df.drop('notes', axis=1, inplace=True)
         if enhanced_df is not None:
             # Save to new CSV
-            NEW_CSV_NAME = "data/vulnerabilities_with_cvss.csv"
+            NEW_CSV_NAME = "output/vulnerabilities_with_cvss.csv"
             enhanced_df.to_csv(NEW_CSV_NAME, index=False)
             print("Enhanced data saved to 'vulnerabilities_with_cvss.csv'")
+            # Add CWE details to enhanced DataFrame
+            enhanced_df = enrich_df_with_cwe_details(enhanced_df)
+            NEW_CSV_NAME = "output/vulnerabilities_with_cwes.csv"
+            enhanced_df.to_csv(NEW_CSV_NAME, index=False)
+            print("Enhanced data saved to 'vulnerabilities_with_cwes.csv'")
